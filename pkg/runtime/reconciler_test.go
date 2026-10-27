@@ -870,6 +870,136 @@ func TestReconcilerAdoptOrCreateResource_Adopt(t *testing.T) {
 	rm.AssertNumberOfCalls(t, "Create", 0)
 }
 
+// TestReconcilerAdoptOrCreateResource_Adopt_PreservesReadOneStatus reproduces
+// the status-clobber bug on the adopt-or-create / ReadOne-succeeds path.
+//
+// On that path Sync calls setResourceManagedAndAdopted(ctx, rm, latest) and
+// then returns `latest`. setResourceManagedAndAdopted runs
+// patchResourceMetadataAndSpec, whose kc.Patch (metadata + spec) has the
+// documented side effect of overwriting latest's Status with desired's
+// (empty) Status. patchResourceMetadataAndSpec repairs that ONLY on the
+// object it RETURNS (latestCleaned.SetStatus(lorig)). Before the fix
+// setResourceManagedAndAdopted discarded that return value, so the `latest`
+// object Sync returns — the one HandleReconcileError later patches to the
+// status subresource — had its discovered Status clobbered to empty and the
+// observed status was never persisted.
+//
+// The testify mocks make kc.Patch a no-op, so the in-place clobber cannot be
+// observed through the mock's Status directly. Instead we route
+// ClearResolvedReferences(latest) to a DISTINCT object (latestCleaned) — the
+// status-preserved object that patchResourceMetadataAndSpec builds and calls
+// SetStatus(lorig) on — and assert that:
+//   - Sync returns latestCleaned (the status-preserved object), not the
+//     original, status-clobbered `latest`; and
+//   - SetStatus was invoked on latestCleaned to restore the preserved status.
+//
+// Pre-fix Sync returns `latest`, so the identity assertion fails.
+func TestReconcilerAdoptOrCreateResource_Adopt_PreservesReadOneStatus(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	ctx := context.TODO()
+	adoptionFieldsString := "{\"arn\": \"my-adopt-book-arn\"}"
+	adoptionFields := map[string]string{
+		"arn": "my-adopt-book-arn",
+	}
+
+	desired, _, metaObj := resourceMocks()
+	desired.On("ReplaceConditions", []*ackv1alpha1.Condition{}).Return()
+	desired.On("Conditions").Return([]*ackv1alpha1.Condition{})
+	desired.On("PopulateResourceFromAnnotation", adoptionFields).Return(nil)
+	metaObj.SetAnnotations(map[string]string{
+		ackv1alpha1.AnnotationAdoptionPolicy: "adopt-or-create",
+		ackv1alpha1.AnnotationAdoptionFields: adoptionFieldsString,
+	})
+
+	ids := &ackmocks.AWSResourceIdentifiers{}
+
+	// `latest` is what ReadOne returns: it carries the discovered (populated)
+	// Status that must survive adoption.
+	latest, latestRTObj, latestMetaObj := resourceMocks()
+	latest.On("Identifiers").Return(ids)
+	latest.On("Conditions").Return([]*ackv1alpha1.Condition{})
+	latest.On(
+		"ReplaceConditions",
+		mock.AnythingOfType("[]*v1alpha1.Condition"),
+	).Return()
+	latestMetaObj.SetAnnotations(map[string]string{
+		ackv1alpha1.AnnotationAdoptionPolicy: "adopt-or-create",
+		ackv1alpha1.AnnotationAdoptionFields: adoptionFieldsString,
+	})
+
+	// `latestCleaned` is the object patchResourceMetadataAndSpec builds from
+	// ClearResolvedReferences(latest) and on which it re-applies the preserved
+	// status via SetStatus(lorig) before returning. The fix must thread this
+	// object back out through setResourceManagedAndAdopted so Sync returns it.
+	latestCleaned, latestCleanedRTObj, _ := resourceMocks()
+	latestCleaned.On("Identifiers").Return(ids)
+	latestCleaned.On("Conditions").Return([]*ackv1alpha1.Condition{})
+	latestCleaned.On(
+		"ReplaceConditions",
+		mock.AnythingOfType("[]*v1alpha1.Condition"),
+	).Return()
+
+	rm := &ackmocks.AWSResourceManager{}
+	rm.On("ResolveReferences", ctx, nil, desired).Return(
+		desired, false, nil,
+	).Times(2)
+	rm.On("ClearResolvedReferences", desired).Return(desired)
+	// Route the cleaned `latest` to a distinct object so we can assert which
+	// object Sync returns. patchResourceMetadataAndSpec's desired side is
+	// ResourceFromRuntimeObject(orig) where orig == latest.RuntimeObject(), so
+	// both cleaned sides resolve through ClearResolvedReferences(latest).
+	rm.On("ClearResolvedReferences", latest).Return(latestCleaned)
+	rm.On("ReadOne", ctx, desired).Return(
+		latest, nil,
+	).Once()
+	rm.On("IsSynced", ctx, latest).Return(true, nil)
+	rm.On("IsSynced", ctx, latestCleaned).Return(true, nil)
+
+	// isManaged=false for `latest` so setResourceManagedAndAdopted proceeds to
+	// MarkManaged/MarkAdopted and actually runs patchResourceMetadataAndSpec,
+	// exercising the status-preservation (and previously the clobber) path.
+	rmf, rd := managerFactoryMocks(desired, latest, false)
+	rd.On("IsManaged", desired).Return(false)
+	rd.On("MarkManaged", latest).Return()
+	rd.On("MarkAdopted", latest).Return()
+	rd.On("ResourceFromRuntimeObject", latestRTObj).Return(latest)
+	// Force the metadata+spec patch to actually fire (metadata is equal because
+	// both cleaned sides are latestCleaned, so drive it via a Spec delta).
+	specDelta := ackcompare.NewDelta()
+	specDelta.Add("Spec", "val1", "val2")
+	rd.On("Delta", latestCleaned, latestCleaned).Return(specDelta)
+
+	r, kc, scmd := reconcilerMocks(rmf)
+	rm.On("EnsureTags", ctx, desired, scmd).Return(nil)
+	rm.On("FilterSystemTags", mock.Anything, []string{})
+	statusWriter := &ctrlrtclientmock.SubResourceWriter{}
+	kc.On("Status").Return(statusWriter)
+	kc.On("Patch", withoutCancelContextMatcher, latestRTObj, mock.AnythingOfType("*client.mergeFromPatch")).Return(nil)
+	kc.On("Patch", withoutCancelContextMatcher, latestCleanedRTObj, mock.AnythingOfType("*client.mergeFromPatch")).Return(nil)
+	statusWriter.On("Patch", withoutCancelContextMatcher, mock.Anything, mock.AnythingOfType("*client.mergeFromPatch")).Return(nil)
+
+	returned, err := r.Sync(ctx, rm, desired)
+	require.NotNil(err) // requeue.Needed from the adopt-or-create branch
+	require.NotNil(returned)
+
+	// The object Sync returns (which HandleReconcileError patches to the status
+	// subresource) must be the status-preserved object produced by
+	// patchResourceMetadataAndSpec, NOT the original `latest` whose Status the
+	// metadata+spec Patch clobbered. Pre-fix Sync returns `latest`.
+	returnedPtr, ok := returned.(*ackmocks.AWSResource)
+	require.True(ok)
+	assert.Same(latestCleaned, returnedPtr,
+		"Sync must return the status-preserved object from "+
+			"setResourceManagedAndAdopted, not the status-clobbered ReadOne result")
+
+	// And the preserved status must have been re-applied to that object.
+	latestCleaned.AssertCalled(t, "SetStatus", mock.Anything)
+	rm.AssertNumberOfCalls(t, "ReadOne", 1)
+	rm.AssertNumberOfCalls(t, "Create", 0)
+}
+
 func TestReconcilerCreate_UnManagedResource_CheckReferencesResolveOnce(t *testing.T) {
 	require := require.New(t)
 
